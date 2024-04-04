@@ -12,7 +12,7 @@ public class ThrottleQueueTaskDispatcher extends QueueTaskDispatcher {
 
 	@Override
 	public CauseOfBlockage canRun(Item item) {
-		QueueResult result = ThrottleManager.get().tryQueueItem(Jenkins.get(), item);
+		QueueResult result = ThrottleManager.get().tryQueueItem(Jenkins.get(), item, true);
 
 		switch (result) {
 		default:

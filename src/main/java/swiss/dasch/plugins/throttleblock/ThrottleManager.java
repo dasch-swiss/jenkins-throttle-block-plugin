@@ -7,11 +7,13 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import org.jenkinsci.Symbol;
+import org.jenkinsci.plugins.durabletask.executors.ContinuedTask;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.StaplerRequest;
 
@@ -32,6 +34,7 @@ import hudson.model.queue.WorkUnit;
 import hudson.model.queue.WorkUnitContext;
 import jenkins.model.GlobalConfiguration;
 import jenkins.model.Jenkins;
+import jenkins.util.Timer;
 import net.sf.json.JSONObject;
 
 @Symbol("throttleBlock")
@@ -69,107 +72,81 @@ public class ThrottleManager extends GlobalConfiguration {
 	}
 
 	public QueueResult tryQueueItem(Node node, Queue.Item item) {
-		return tryQueue(node, item, null);
+		return tryQueue(node, item, null, false);
 	}
 
-	public QueueResult tryQueueLock(Node node, RunBlockingState state) {
-		return tryQueue(node, null, state);
+	public QueueResult tryQueueItem(Node node, Queue.Item item, boolean isSynchronizedWithQueue) {
+		return tryQueue(node, item, null, isSynchronizedWithQueue);
 	}
 
-	private QueueResult tryQueue(Node node, Queue.Item item, RunBlockingState state) {
+	public QueueResult tryQueueLock(Node node, RunBlockingState runState) {
+		return tryQueue(node, null, runState, false);
+	}
+
+	private QueueResult tryQueue(Node node, Queue.Item item, RunBlockingState runState,
+			boolean isSynchronizedWithQueue) {
 		Run<?, ?> run = null;
 
 		QueueBlockingState queueState = null;
-		boolean wasQueued = false;
-		boolean isQueued = false;
+		boolean wasPotentiallyPendingOrRunning = false;
+		boolean isPotentiallyPendingOrRunning = false;
 
 		IThrottleLock dequeuedLock = null;
 
 		try {
 			synchronized (this) {
-				run = state != null ? state.getRun() : null;
-				queueState = item == null ? null : queueBlockingStates.get(item.getId());
+				boolean changed = false;
 
-				// Reset queued state to false because the item
-				// has gone backwards in the queue cycle
-				if (queueState != null) {
-					wasQueued = queueState.isQueued;
-					queueState.isQueued = isQueued = false;
-				}
+				try {
+					run = runState != null ? runState.getRun() : null;
+					queueState = item == null ? null : queueBlockingStates.get(item.getId());
 
-				// If there are any other items queued then we
-				// must return false because those queued items
-				// may start being executed outside of our control
-				for (long id : queueBlockingStates.keySet()) {
-					if ((item == null || id != item.getId()) && (run == null || id != run.getQueueId())
-							&& queueBlockingStates.get(id).isBlocking()) {
-						return QueueResult.BLOCKED_BY_QUEUED_ITEM;
+					// Reset queue pending state to false because the item
+					// has gone backwards in the queue cycle, it can't be
+					// pending anymore
+					if (queueState != null) {
+						wasPotentiallyPendingOrRunning = queueState.isPotentiallyPendingOrRunning;
+						queueState.isPotentiallyPendingOrRunning = isPotentiallyPendingOrRunning = false;
+						changed = wasPotentiallyPendingOrRunning != false;
 					}
-				}
 
-				// Check if there are any runs that are
-				// actually blocking
-				for (RunBlockingState otherState : runBlockingStates) {
-					if (otherState.isBlocking(getTimeoutAfterUnlock())) {
-						return QueueResult.BLOCKED_BY_BLOCKING_STATE;
+					// Check if there is anything blocking and
+					// if so return the reason
+					QueueResult result = this.checkBlocked(node, run, item, isSynchronizedWithQueue);
+					if (result != QueueResult.OK) {
+						return result;
 					}
-				}
 
-				Computer computer = node.toComputer();
-				if (computer != null) {
-					for (Executor executor : computer.getExecutors()) {
+					// If all checks are passed then this item or
+					// state may proceed
 
-						// Check if there are any runs on this
-						// computer that are running and don't
-						// have a blocking state yet -> must
-						// assume they haven't checked out yet
-						Executable executable = executor.getCurrentExecutable();
-						if (executable != null) {
-							Run<?, ?> executorRun = null;
-							if (executable instanceof Run<?, ?>) {
-								executorRun = (Run<?, ?>) executable;
-							} else {
-								executable = executable.getParentExecutable();
-								if (executable instanceof Run<?, ?>) {
-									executorRun = (Run<?, ?>) executable;
-								}
-							}
+					// If the item is a BuildableItem or task is
+					// a FlyweightTask then it may become a pending
+					// or running item without canRun/tryQueue being
+					// called again
+					if (queueState != null
+							&& (item instanceof BuildableItem || item.task instanceof Queue.FlyweightTask)) {
+						queueState.isPotentiallyPendingOrRunning = isPotentiallyPendingOrRunning = true;
+						changed = true;
+					}
 
-							if (executorRun != null && isThrottlingBeforeRun(executorRun.getParent())
-									&& getRunBlockingState(executorRun) == null) {
-								return QueueResult.BLOCKED_BY_NO_BLOCKING_STATE;
-							}
+					// If state is specified then try to dequeue a
+					// lock
+					if (runState != null) {
+						dequeuedLock = runState.tryDequeueLock();
+						if (dequeuedLock == null) {
+							return QueueResult.NO_LOCK_ENTERED;
 						} else {
-							// If there is no executable yet but a work unit
-							// (i.e. the item has left the queue but hasn't
-							// started executing yet), then we must also block
-							// unless this work unit is the same as the item
-							// trying to be queued
-							WorkUnit workUnit = executor.getCurrentWorkUnit();
-							if (workUnit != null && (item == null || workUnit.context.item.getId() != item.getId())) {
-								return QueueResult.BLOCKED_BY_WORK_UNIT;
-							}
+							changed = true;
 						}
+					}
 
+					return QueueResult.OK;
+				} finally {
+					if (changed) {
+						save();
 					}
 				}
-
-				// If all checks are passed then this item or
-				// lock enter may be queued/started
-				if (queueState != null) {
-					queueState.isQueued = isQueued = true;
-				}
-
-				// If state is specified then try to dequeue a
-				// lock
-				if (state != null) {
-					dequeuedLock = state.tryDequeueLock();
-					if (dequeuedLock == null) {
-						return QueueResult.NO_LOCK_ENTERED;
-					}
-				}
-
-				return QueueResult.OK;
 			}
 		} finally {
 			// If a lock was dequeued then it must also
@@ -178,13 +155,102 @@ public class ThrottleManager extends GlobalConfiguration {
 				dequeuedLock.enter();
 			}
 
-			// If an item goes from queued to non queued then
+			// If an item goes from pending to non pending then
 			// this may allow other blocking state locks to enter
 			// -> yield
-			if (wasQueued && !isQueued) {
+			if (wasPotentiallyPendingOrRunning && !isPotentiallyPendingOrRunning) {
 				yield();
 			}
 		}
+	}
+
+	private synchronized QueueResult checkBlocked(Node node, Run<?, ?> run, Queue.Item item,
+			boolean isSynchronizedWithQueue) {
+		Queue.Task task = item != null ? item.task : null;
+
+		// Don't block task if it is not configured to throttle
+		if (run == null && !isThrottlingBeforeRun(task)) {
+			return QueueResult.OK;
+		}
+
+		// Never block continued/resuming tasks
+		if (run == null && task instanceof ContinuedTask && ((ContinuedTask) task).isContinued()) {
+			return QueueResult.OK;
+		}
+
+		Queue queue = Queue.getInstance();
+
+		// If there are any other items queued then we
+		// must return false because those queued items
+		// may start being executed outside of our control
+		for (long id : queueBlockingStates.keySet()) {
+			if ((item == null || id != item.getId()) && (run == null || id != run.getQueueId())
+					&& queueBlockingStates.get(id).isPotentiallyBlocking()) {
+
+				// If we're synchronized with the queue then
+				// we can skip an item if it is not pending
+				// because it'll have to be checked again
+				// before moving to the pending queue
+				if (isSynchronizedWithQueue) {
+					Queue.Item queueItem = queue.getItem(id);
+
+					if (queueItem instanceof BuildableItem && !((BuildableItem) queueItem).isPending()) {
+						continue;
+					}
+				}
+
+				return QueueResult.BLOCKED_BY_QUEUED_ITEM;
+			}
+		}
+
+		// Check if there are any runs that are
+		// actually blocking
+		for (RunBlockingState otherState : runBlockingStates) {
+			if ((run == null || otherState.getRun() != run) && otherState.isBlocking(getTimeoutAfterUnlock())) {
+				return QueueResult.BLOCKED_BY_BLOCKING_STATE;
+			}
+		}
+
+		Computer computer = node.toComputer();
+		if (computer != null) {
+			for (Executor executor : computer.getExecutors()) {
+
+				// Check if there are any runs on this
+				// computer that are running and don't
+				// have a blocking state yet -> must
+				// assume they haven't checked out yet
+				Executable executable = executor.getCurrentExecutable();
+				if (executable != null) {
+					Run<?, ?> executorRun = null;
+					if (executable instanceof Run<?, ?>) {
+						executorRun = (Run<?, ?>) executable;
+					} else {
+						executable = executable.getParentExecutable();
+						if (executable instanceof Run<?, ?>) {
+							executorRun = (Run<?, ?>) executable;
+						}
+					}
+
+					if (executorRun != null && isThrottlingBeforeRun(executorRun.getParent())
+							&& getRunBlockingState(executorRun) == null) {
+						return QueueResult.BLOCKED_BY_NO_BLOCKING_STATE;
+					}
+				} else {
+					// If there is no executable yet but a work unit
+					// (i.e. the item has left the queue but hasn't
+					// started executing yet), then we must also block
+					// unless this work unit is the same as the item
+					// trying to be queued
+					WorkUnit workUnit = executor.getCurrentWorkUnit();
+					if (workUnit != null && (item == null || workUnit.context.item.getId() != item.getId())) {
+						return QueueResult.BLOCKED_BY_WORK_UNIT;
+					}
+				}
+
+			}
+		}
+
+		return QueueResult.OK;
 	}
 
 	public boolean createRunBlockingState(Run<?, ?> run) {
@@ -194,6 +260,8 @@ public class ThrottleManager extends GlobalConfiguration {
 	public boolean createRunBlockingState(Run<?, ?> run, IThrottleLock lock) {
 		RunBlockingState state = null;
 		boolean isNewState = false;
+
+		boolean changed = false;
 
 		synchronized (this) {
 			for (RunBlockingState s : runBlockingStates) {
@@ -209,10 +277,15 @@ public class ThrottleManager extends GlobalConfiguration {
 				state = new RunBlockingState(run);
 				runBlockingStates.add(state);
 				isNewState = true;
+				changed = true;
 			}
 
 			if (lock != null) {
-				state.queueLock(lock);
+				changed |= state.queueLock(lock);
+			}
+
+			if (changed) {
+				save();
 			}
 		}
 
@@ -224,6 +297,7 @@ public class ThrottleManager extends GlobalConfiguration {
 			tryEnterLock(state);
 		} else if (isNewState) {
 			yield();
+			scheduleMaintenanceAfterTimeout();
 		}
 
 		return isNewState;
@@ -261,6 +335,13 @@ public class ThrottleManager extends GlobalConfiguration {
 		}
 	}
 
+	public void scheduleMaintenanceAfterTimeout() {
+		Timer.get().schedule(() -> {
+			yield();
+			Queue.getInstance().scheduleMaintenance();
+		}, this.getTimeoutAfterUnlock() + 10, TimeUnit.MILLISECONDS);
+	}
+
 	public synchronized RunBlockingState getRunBlockingState(Run<?, ?> run) {
 		for (RunBlockingState state : runBlockingStates) {
 			if (state.getRun() == run) {
@@ -286,6 +367,10 @@ public class ThrottleManager extends GlobalConfiguration {
 					deleted = true;
 				}
 			}
+
+			if (deleted) {
+				save();
+			}
 		}
 
 		if (deleted) {
@@ -304,6 +389,10 @@ public class ThrottleManager extends GlobalConfiguration {
 
 		synchronized (this) {
 			removed = queueBlockingStates.remove(id) != null;
+
+			if (removed) {
+				save();
+			}
 		}
 
 		if (removed) {
@@ -313,8 +402,12 @@ public class ThrottleManager extends GlobalConfiguration {
 
 	private synchronized void setQueueBlockingStateWork(long id, WorkUnitContext work) {
 		QueueBlockingState state = queueBlockingStates.get(id);
-		if (state != null) {
+		if (state != null && state.work != work) {
 			state.work = work;
+
+			// Work might be immediately done
+			yield();
+			scheduleMaintenanceAfterTimeout();
 		}
 	}
 
@@ -323,6 +416,8 @@ public class ThrottleManager extends GlobalConfiguration {
 
 		Queue.withLock(() -> {
 			synchronized (this) {
+				boolean changed = false;
+
 				Iterator<Long> it = queueBlockingStates.keySet().iterator();
 
 				while (it.hasNext()) {
@@ -340,26 +435,56 @@ public class ThrottleManager extends GlobalConfiguration {
 						// the state has expired and is of no more use
 						if (state.work == null || state.isExpired()) {
 							it.remove();
+							changed = true;
+						}
+					} else if (item instanceof BuildableItem && item.task instanceof Queue.FlyweightTask == false
+							&& !((BuildableItem) item).isPending()) {
+						// If the item is not pending here then it will
+						// have to go through tryQueue again before it
+						// starts running, so it needn't block others.
+						// This is necessary to give blocking states a
+						// chance to unblock if there are no executors
+						// available causing items to remain in the
+						// buildable queue.
+						QueueBlockingState state = queueBlockingStates.get(id);
+						if (state.isPotentiallyPendingOrRunning) {
+							state.isPotentiallyPendingOrRunning = false;
+							changed = true;
 						}
 					}
+				}
+
+				if (changed) {
+					save();
 				}
 			}
 		});
 
 		synchronized (this) {
+			boolean changed = false;
+
 			Iterator<RunBlockingState> it = runBlockingStates.iterator();
 			while (it.hasNext()) {
 				RunBlockingState state = it.next();
 				if (state.tryClearOnExpiration(getTimeoutAfterUnlock())) {
 					it.remove();
+					changed = true;
 				}
+			}
+
+			if (changed) {
+				save();
 			}
 		}
 
-		ThrottleManager.get().yield();
+		yield();
 	}
 
-	public boolean isThrottlingBeforeRun(Job<?, ?> job) {
+	public static boolean isThrottlingBeforeRun(Queue.Task task) {
+		return task instanceof Job<?, ?> && isThrottlingBeforeRun((Job<?, ?>) task);
+	}
+
+	public static boolean isThrottlingBeforeRun(Job<?, ?> job) {
 		ThrottleJobProperty property = job.getProperty(ThrottleJobProperty.class);
 		return property != null && property.getRunThrottle() != null;
 	}
@@ -387,11 +512,11 @@ public class ThrottleManager extends GlobalConfiguration {
 
 		private static final long serialVersionUID = -1543503806460682092L;
 
-		private volatile boolean isQueued;
+		private volatile boolean isPotentiallyPendingOrRunning;
 		private transient WorkUnitContext work;
 
-		private boolean isBlocking() {
-			return isQueued && !isExpired();
+		private boolean isPotentiallyBlocking() {
+			return isPotentiallyPendingOrRunning && !isExpired();
 		}
 
 		private boolean isExpired() {
@@ -399,8 +524,7 @@ public class ThrottleManager extends GlobalConfiguration {
 				// If the job isn't configured to enter the
 				// throttle before running then this queue
 				// state isn't needed at all
-				if (work.task instanceof Job<?, ?>
-						&& !ThrottleManager.get().isThrottlingBeforeRun((Job<?, ?>) work.task)) {
+				if (!ThrottleManager.isThrottlingBeforeRun(work.task)) {
 					return true;
 				}
 
@@ -412,11 +536,13 @@ public class ThrottleManager extends GlobalConfiguration {
 				}
 
 				// If there already is an executable and it
-				// already has a blocking state then we don't
-				// need the queue state anymore
+				// already has a blocking state or is already
+				// finished then we don't need the queue state
+				// anymore
 				Executable executable = work.getPrimaryWorkUnit().getExecutable();
-				if (executable != null && (executable instanceof Run<?, ?> == false
-						|| ThrottleManager.get().getRunBlockingState((Run<?, ?>) executable) != null)) {
+				if (executable != null
+						&& (executable instanceof Run<?, ?> == false || !((Run<?, ?>) executable).isBuilding()
+								|| ThrottleManager.get().getRunBlockingState((Run<?, ?>) executable) != null)) {
 					return true;
 				}
 			}
@@ -431,7 +557,7 @@ public class ThrottleManager extends GlobalConfiguration {
 		private void checkAndCreateQueueState(Queue.Item item) {
 			// Queue state is only needed to throttle jobs
 			// before running
-			if (item.task instanceof Job<?, ?> && !ThrottleManager.get().isThrottlingBeforeRun((Job<?, ?>) item.task)) {
+			if (!ThrottleManager.isThrottlingBeforeRun(item.task)) {
 				return;
 			}
 

@@ -44,7 +44,13 @@ public class RunBlockingState implements Serializable {
 
 	public synchronized boolean isExpired(long msAfterLastUnlock) {
 		Run<?, ?> run = getRun();
-		return !isBlockingByTimeout(msAfterLastUnlock) && (run == null || !run.isBuilding());
+		if (!isBlockingByTimeout(msAfterLastUnlock)) {
+			// No longer needed if run has already finished
+			if (run == null || !run.isBuilding()) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	public boolean tryClearOnExpiration(long msAfterLastUnlock) {
@@ -65,6 +71,9 @@ public class RunBlockingState implements Serializable {
 			for (IThrottleLock lock : locks) {
 				lock.abort();
 			}
+
+			ThrottleManager.get().save();
+
 			return true;
 		}
 
@@ -78,7 +87,9 @@ public class RunBlockingState implements Serializable {
 	public boolean unlock(Predicate<IThrottleLock> predicate) {
 		boolean unlocked = testAndUnlock(predicate);
 		if (unlocked) {
+			ThrottleManager.get().save();
 			ThrottleManager.get().yield();
+			ThrottleManager.get().scheduleMaintenanceAfterTimeout();
 		}
 		return unlocked;
 	}
