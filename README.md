@@ -1,4 +1,4 @@
-# Jenkins Lockdown Plugin
+# Jenkins Throttle Block Plugin
 
 This Jenkins plugin allows throttling jobs and/or pipeline blocks. It can also be used to throttle the initial SCM checkout.
 
